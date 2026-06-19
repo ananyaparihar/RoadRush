@@ -2,13 +2,23 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
 <title>RoadRush — Arcade Racer</title>
 <style>
   *{margin:0;padding:0;box-sizing:border-box}
-  body{background:#0a0a0f;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:'Courier New',monospace;overflow:hidden}
+  html,body{
+    background:#0a0a0f;
+    width:100%;height:100%;
+    overflow:hidden;
+    overscroll-behavior:none; /* stop pull-to-refresh from hijacking swipes */
+  }
+  body{display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:'Courier New',monospace}
   canvas{display:block;image-rendering:pixelated}
-  #gameCanvas{border:2px solid #1a1a2e;box-shadow:0 0 40px #7f77dd44}
+  #gameCanvas{
+    border:2px solid #1a1a2e;
+    box-shadow:0 0 40px #7f77dd44;
+    touch-action:none; /* FIX: stop the browser intercepting taps/drags as scroll or zoom gestures */
+  }
 </style>
 </head>
 <body>
@@ -19,8 +29,22 @@ const ctx=C.getContext('2d');
 
 const W=400,H=600;
 C.width=W;C.height=H;
-C.style.width=Math.min(W,window.innerWidth*0.95)+'px';
-C.style.height=Math.min(H,window.innerHeight*0.97)+'px';
+
+// FIX: previous sizing used innerWidth/innerHeight independently, which
+// could distort aspect ratio and didn't update on rotation or mobile
+// browser chrome (address bar) resizing. This keeps the 400:600 ratio
+// and recalculates whenever the viewport changes.
+function resizeCanvas(){
+  const margin=0.95;
+  const availW=window.innerWidth*margin;
+  const availH=window.innerHeight*margin;
+  const scale=Math.min(availW/W,availH/H);
+  C.style.width=(W*scale)+'px';
+  C.style.height=(H*scale)+'px';
+}
+resizeCanvas();
+window.addEventListener('resize',resizeCanvas);
+window.addEventListener('orientationchange',()=>setTimeout(resizeCanvas,100));
 
 /* ── PALETTE ── */
 const P={
@@ -154,18 +178,53 @@ window.addEventListener('keydown',e=>{
 window.addEventListener('keyup',e=>{keys[e.key]=false;});
 
 /* ── TOUCH ── */
-let touchStartX=null;
-C.addEventListener('touchstart',e=>{touchStartX=e.touches[0].clientX;e.preventDefault();},{passive:false});
+// FIX: mobile taps were getting swallowed because touchstart called
+// preventDefault() unconditionally, which suppresses the browser's
+// synthetic click event. Result: menu buttons were untappable on phones.
+// New approach: track touch start position/time, and on touchend decide
+// whether it was a TAP (short, little movement -> route to handleClick)
+// or a DRAG (used only during gameplay for steering).
+let touchStartX=null,touchStartY=null,touchStartTime=0,touchMoved=false;
+
+C.addEventListener('touchstart',e=>{
+  const t=e.touches[0];
+  touchStartX=t.clientX;
+  touchStartY=t.clientY;
+  touchStartTime=Date.now();
+  touchMoved=false;
+  e.preventDefault();
+},{passive:false});
+
 C.addEventListener('touchmove',e=>{
-  if(touchStartX!==null&&state==='play'&&!paused){
-    let dx=e.touches[0].clientX-touchStartX;
-    player.vx=dx*0.15;
+  const t=e.touches[0];
+  if(touchStartX!==null){
+    let dx=t.clientX-touchStartX;
+    let dy=t.clientY-touchStartY;
+    if(Math.abs(dx)>8||Math.abs(dy)>8) touchMoved=true;
+    // Steering only applies during active gameplay
+    if(state==='play'&&!paused){
+      player.vx=dx*0.15;
+    }
   }
   e.preventDefault();
 },{passive:false});
-C.addEventListener('touchend',e=>{touchStartX=null;if(state==='play')player.vx=0;},{passive:false});
 
-/* ── CLICK HANDLER ── */
+C.addEventListener('touchend',e=>{
+  const dt=Date.now()-touchStartTime;
+  // A tap = short duration + little/no movement -> treat as a click
+  if(!touchMoved && dt<400 && touchStartX!==null){
+    const rect=C.getBoundingClientRect();
+    const scaleX=W/rect.width, scaleY=H/rect.height;
+    const mx=(touchStartX-rect.left)*scaleX;
+    const my=(touchStartY-rect.top)*scaleY;
+    handleClick(mx,my);
+  }
+  if(state==='play') player.vx=0;
+  touchStartX=null;touchStartY=null;touchMoved=false;
+  e.preventDefault();
+},{passive:false});
+
+/* ── CLICK HANDLER (desktop mouse) ── */
 C.addEventListener('click',e=>{
   const rect=C.getBoundingClientRect();
   const scaleX=W/rect.width, scaleY=H/rect.height;
