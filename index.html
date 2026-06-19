@@ -179,12 +179,28 @@ window.addEventListener('keyup',e=>{keys[e.key]=false;});
 
 /* ── TOUCH ── */
 // FIX: mobile taps were getting swallowed because touchstart called
-// preventDefault() unconditionally, which suppresses the browser's
-// synthetic click event. Result: menu buttons were untappable on phones.
-// New approach: track touch start position/time, and on touchend decide
-// whether it was a TAP (short, little movement -> route to handleClick)
-// or a DRAG (used only during gameplay for steering).
+// preventDefault() unconditionally, suppressing the browser's synthetic
+// click event. Fixed by detecting taps ourselves and routing to handleClick.
+//
+// FIX 2 (this round): the previous version computed steering as an
+// incremental delta inside touchmove and wrote it straight to player.vx.
+// touchmove does NOT fire every animation frame on mobile (browsers often
+// throttle it well below 60fps), so most frames in update() had no new
+// touchmove data and player.vx just sat at whatever tiny/zero value the
+// last move event left it at -> the car barely twitched.
+//
+// New approach: touchmove just records the CURRENT finger X position in
+// canvas-space (touchTargetX). Every frame, update() steers the player
+// toward that X continuously, the same way it would steer toward a key
+// being held down. This guarantees smooth movement regardless of how
+// often touchmove actually fires.
 let touchStartX=null,touchStartY=null,touchStartTime=0,touchMoved=false;
+let touchTargetX=null; // canvas-space X the finger is currently at, or null if not dragging
+
+function toCanvasX(clientX){
+  const rect=C.getBoundingClientRect();
+  return (clientX-rect.left)*(W/rect.width);
+}
 
 C.addEventListener('touchstart',e=>{
   const t=e.touches[0];
@@ -192,19 +208,17 @@ C.addEventListener('touchstart',e=>{
   touchStartY=t.clientY;
   touchStartTime=Date.now();
   touchMoved=false;
+  if(state==='play') touchTargetX=toCanvasX(t.clientX);
   e.preventDefault();
 },{passive:false});
 
 C.addEventListener('touchmove',e=>{
   const t=e.touches[0];
   if(touchStartX!==null){
-    let dx=t.clientX-touchStartX;
-    let dy=t.clientY-touchStartY;
-    if(Math.abs(dx)>8||Math.abs(dy)>8) touchMoved=true;
-    // Steering only applies during active gameplay
-    if(state==='play'&&!paused){
-      player.vx=dx*0.15;
-    }
+    let totalDx=t.clientX-touchStartX;
+    let totalDy=t.clientY-touchStartY;
+    if(Math.abs(totalDx)>8||Math.abs(totalDy)>8) touchMoved=true;
+    if(state==='play'&&!paused) touchTargetX=toCanvasX(t.clientX);
   }
   e.preventDefault();
 },{passive:false});
@@ -213,13 +227,12 @@ C.addEventListener('touchend',e=>{
   const dt=Date.now()-touchStartTime;
   // A tap = short duration + little/no movement -> treat as a click
   if(!touchMoved && dt<400 && touchStartX!==null){
+    const mx=toCanvasX(touchStartX);
     const rect=C.getBoundingClientRect();
-    const scaleX=W/rect.width, scaleY=H/rect.height;
-    const mx=(touchStartX-rect.left)*scaleX;
-    const my=(touchStartY-rect.top)*scaleY;
+    const my=(touchStartY-rect.top)*(H/rect.height);
     handleClick(mx,my);
   }
-  if(state==='play') player.vx=0;
+  touchTargetX=null; // stop steering, let player.vx decay naturally in update()
   touchStartX=null;touchStartY=null;touchMoved=false;
   e.preventDefault();
 },{passive:false});
@@ -432,15 +445,35 @@ function update(){
   const roadSpeed=st.speed*speedMult;
 
   /* ── PLAYER MOVEMENT (left/right only — Y is fixed) ── */
+  // FIX: touch steering is now POSITION-based, read fresh every frame here,
+  // instead of relying on touchmove events to directly set velocity (which
+  // don't fire every frame on mobile and caused the car to barely move).
   let moveX=0;
   if(keys['ArrowLeft']||keys['a']||keys['A']) moveX=-1;
   if(keys['ArrowRight']||keys['d']||keys['D']) moveX=1;
 
-  if(st.slippery||st.icy){
-    player.vx=player.vx*0.90+moveX*3.5;
+  if(moveX!==0){
+    // Keyboard steering
+    if(st.slippery||st.icy){
+      player.vx=player.vx*0.90+moveX*3.5;
+    } else {
+      player.vx=moveX*5;
+    }
+  } else if(touchTargetX!==null){
+    // Touch steering: continuously chase the finger's current X position.
+    // This re-evaluates every single frame regardless of touchmove firing rate.
+    const diff=touchTargetX-player.x;
+    if(st.slippery||st.icy){
+      player.vx=player.vx*0.90+Math.max(-3.5,Math.min(3.5,diff*0.25));
+    } else {
+      player.vx=Math.max(-7,Math.min(7,diff*0.3));
+    }
   } else {
-    player.vx=moveX*5;
+    // No input -> decelerate to a stop
+    player.vx*=0.8;
+    if(Math.abs(player.vx)<0.05) player.vx=0;
   }
+
   player.x+=player.vx;
   const roadX=(W-280)/2;
   player.x=Math.max(roadX+player.w/2,Math.min(roadX+280-player.w/2,player.x));
