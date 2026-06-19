@@ -1,0 +1,1075 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RoadRush — Arcade Racer</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:#0a0a0f;display:flex;align-items:center;justify-content:center;min-height:100vh;font-family:'Courier New',monospace;overflow:hidden}
+  canvas{display:block;image-rendering:pixelated}
+  #gameCanvas{border:2px solid #1a1a2e;box-shadow:0 0 40px #7f77dd44}
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+const C=document.getElementById('gameCanvas');
+const ctx=C.getContext('2d');
+
+const W=400,H=600;
+C.width=W;C.height=H;
+C.style.width=Math.min(W,window.innerWidth*0.95)+'px';
+C.style.height=Math.min(H,window.innerHeight*0.97)+'px';
+
+/* ── PALETTE ── */
+const P={
+  bg:'#0a0a0f',road:'#1a1a2e',
+  player:'#00e5ff',playerDark:'#0088aa',playerGlass:'#aaffff',
+  enemy:'#ff4444',enemyDark:'#aa0000',
+  truck:'#ff8800',truckDark:'#aa5500',
+  boss:'#ff00aa',bossDark:'#880066',
+  shield:'#00aaff',shieldGlow:'#00ffff44',
+  hud:'#00e5ff',hudBg:'#00000099',
+  star:'#ffe600',
+  neon1:'#7f77dd',neon2:'#ff00aa',neon3:'#00e5ff',
+};
+
+/* ── STAGES ── */
+const STAGES=[
+  {name:'City Streets',   lanes:3,speed:3,  spawnRate:90, bg:'#0a0a12',overlay:null,        boss:null,                target:800,  theme:'city'},
+  {name:'Highway Rush',   lanes:4,speed:4.5,spawnRate:70, bg:'#0a0a0a',overlay:null,        boss:null,                target:1800, theme:'highway'},
+  {name:'Desert Storm',   lanes:3,speed:4,  spawnRate:80, bg:'#1a1200',overlay:'sandstorm', boss:'Giga Convoy',       target:3000, theme:'desert'},
+  {name:'Mountain Pass',  lanes:2,speed:3.5,spawnRate:100,bg:'#101820',overlay:null,        boss:null,                target:4500, boulders:true,theme:'mountain'},
+  {name:'Night City',     lanes:4,speed:5,  spawnRate:65, bg:'#000008',overlay:'night',     boss:null,                target:6500, theme:'night'},
+  {name:'Rainy Highway',  lanes:3,speed:4,  spawnRate:75, bg:'#080818',overlay:'rain',      boss:'Police Interceptor',target:8500, slippery:true,theme:'rain'},
+  {name:'Neon Race Track',lanes:4,speed:6,  spawnRate:55, bg:'#080010',overlay:'neon',      boss:null,                target:11000,theme:'neon'},
+  {name:'Glacier Pass',   lanes:3,speed:3.5,spawnRate:85, bg:'#0a1020',overlay:'snow',      boss:'Blizzard Tank',     target:14000,icy:true,theme:'glacier'},
+];
+
+const POWERUPS=[
+  {type:'shield',color:'#00aaff',label:'SHD',duration:0},
+  {type:'boost', color:'#ffe600',label:'2X', duration:480},
+  {type:'slowmo',color:'#aa00ff',label:'SLO',duration:300},
+  {type:'nitro', color:'#ff6600',label:'NIT',duration:180},
+  {type:'life',  color:'#ff4488',label:'+1', duration:0},
+  {type:'magnet',color:'#ff00aa',label:'MAG',duration:420},
+  {type:'bomb',  color:'#ff2200',label:'BOM',duration:0},
+  {type:'ghost', color:'#aaffaa',label:'GHO',duration:360},
+];
+
+/* ── SAVE ── */
+let save={unlocked:[1],hiscores:{}};
+try{let s=localStorage.getItem('roadrush');if(s)save=JSON.parse(s);}catch(e){}
+function saveProg(){try{localStorage.setItem('roadrush',JSON.stringify(save));}catch(e){}}
+
+/* ── STATE ── */
+let state='menu';
+let stageIdx=0;
+let score=0,lives=3,scoreAdd=1;
+let campaignMode=false,campaignScore=0,campaignLives=3;
+let muted=false,paused=false;
+
+/* ── ROAD SCROLL ── */
+// stripeY drives lane stripe animation — increases each frame so stripes appear to scroll DOWN
+// giving the illusion the player car is moving FORWARD (upward on screen)
+let stripeY=0;
+let parallax2=0;
+
+/* ── PLAYER ── */
+// Player stays at fixed Y (bottom area). Only X changes when steering.
+let player={x:W/2,y:H-110,w:30,h:52,vx:0,shielded:false,ghosted:false,nitro:false,invincible:false,invT:0};
+let magnetActive=false,magnetT=0;
+let activeEffects={};
+// FIX: shake is now decayed in the main loop always, not just in update()
+let shake=0;
+
+/* ── ENTITIES ── */
+let enemies=[];
+let particles=[];
+let powerups=[];
+let boulders=[];
+
+/* ── BOSS ── */
+let boss=null;
+let bossHP=0,bossMaxHP=0,bossTimer=0;
+let bossSpawned=false;
+
+/* ── SPAWN TIMERS ── */
+let spawnTimer=0;
+let powerupTimer=0;
+
+/* ── PROGRESSIVE SPEED ── */
+// stageTime counts frames elapsed in the current stage.
+// Every 10 seconds (600 frames) speed ramps by 8%, capped at 2.5x base.
+let stageTime=0;
+
+/* ── SCORE ACCUMULATOR ── */
+// Use a float accumulator so score increments feel smooth and consistent
+let scoreAcc=0;
+
+/* ── INPUT ── */
+const keys={};
+window.addEventListener('keydown',e=>{
+  // FIX: prevent Escape from doing browser stuff during gameplay
+  if(e.key==='Escape') e.preventDefault();
+
+  keys[e.key]=true;
+
+  if(state==='play'){
+    if(e.key==='p'||e.key==='P') paused=!paused;
+    // FIX: ESC during play just pauses, doesn't exit
+    if(e.key==='Escape') paused=!paused;
+    return; // don't process menu keys while playing
+  }
+
+  if(e.key==='m'||e.key==='M') muted=!muted;
+
+  if(state==='menu'){
+    if(e.key==='Enter') startGame(stageIdx,false);
+    if(e.key==='c'||e.key==='C') startCampaign();
+    if(e.key==='ArrowRight'||e.key==='d'||e.key==='D') stageIdx=Math.min(7,stageIdx+1);
+    if(e.key==='ArrowLeft' ||e.key==='a'||e.key==='A') stageIdx=Math.max(0,stageIdx-1);
+  }
+  if(state==='select'){
+    if(e.key==='Enter') startGame(stageIdx,false);
+    if(e.key==='c'||e.key==='C') startCampaign();
+    if(e.key==='r'||e.key==='R'){save={unlocked:[1],hiscores:{}};saveProg();}
+    if(e.key==='Escape'||e.key==='q'||e.key==='Q') state='menu';
+    if(e.key==='ArrowRight'||e.key==='d') stageIdx=Math.min(7,stageIdx+1);
+    if(e.key==='ArrowLeft' ||e.key==='a') stageIdx=Math.max(0,stageIdx-1);
+  }
+  if(state==='results'){
+    if(e.key==='Enter'&&campaignMode) nextCampaignStage();
+    else if(e.key==='r'||e.key==='R') startGame(stageIdx,campaignMode);
+    else if(e.key==='Escape') returnToMenu();
+  }
+  if(state==='gameover'){
+    if(e.key==='Enter'||e.key==='Escape') returnToMenu();
+    if(e.key==='r'||e.key==='R') startGame(stageIdx,campaignMode);
+  }
+  if(state==='levelup'&&e.key==='Enter') proceedAfterLevelUp();
+  if(state==='victory'&&(e.key==='Enter'||e.key==='Escape')) returnToMenu();
+});
+window.addEventListener('keyup',e=>{keys[e.key]=false;});
+
+/* ── TOUCH ── */
+let touchStartX=null;
+C.addEventListener('touchstart',e=>{touchStartX=e.touches[0].clientX;e.preventDefault();},{passive:false});
+C.addEventListener('touchmove',e=>{
+  if(touchStartX!==null&&state==='play'&&!paused){
+    let dx=e.touches[0].clientX-touchStartX;
+    player.vx=dx*0.15;
+  }
+  e.preventDefault();
+},{passive:false});
+C.addEventListener('touchend',e=>{touchStartX=null;if(state==='play')player.vx=0;},{passive:false});
+
+/* ── CLICK HANDLER ── */
+C.addEventListener('click',e=>{
+  const rect=C.getBoundingClientRect();
+  const scaleX=W/rect.width, scaleY=H/rect.height;
+  handleClick((e.clientX-rect.left)*scaleX,(e.clientY-rect.top)*scaleY);
+});
+
+function handleClick(mx,my){
+  if(state==='menu'){
+    if(my>240&&my<280&&mx>100&&mx<300) startGame(stageIdx,false);
+    if(my>290&&my<330&&mx>100&&mx<300) startCampaign();
+    if(my>340&&my<380&&mx>100&&mx<300) state='select';
+    if(mx<60&&my>H/2-15&&my<H/2+15) stageIdx=Math.max(0,stageIdx-1);
+    if(mx>W-60&&my>H/2-15&&my<H/2+15) stageIdx=Math.min(7,stageIdx+1);
+  }
+  if(state==='select'){
+    for(let i=0;i<8;i++){
+      let col=i%4,row=Math.floor(i/4);
+      let bx=20+col*95,by=80+row*100;
+      if(mx>bx&&mx<bx+85&&my>by&&my<by+85){
+        if(save.unlocked.includes(i+1)){stageIdx=i;startGame(i,false);}
+      }
+    }
+    if(my>500&&my<540&&mx>120&&mx<280) startCampaign();
+    if(my>500&&my<540&&mx>10&&mx<110){save={unlocked:[1],hiscores:{}};saveProg();}
+    if(my>550&&mx>150&&mx<250) state='menu';
+  }
+  if(state==='results'){
+    if(campaignMode&&my>430&&my<470&&mx>200&&mx<390) nextCampaignStage();
+    if(my>480&&my<520&&mx>10&&mx<200) returnToMenu();
+  }
+  if(state==='gameover'){
+    if(my>380&&my<420&&mx>100&&mx<300) returnToMenu();
+    if(my>430&&my<470&&mx>100&&mx<300) startGame(stageIdx,campaignMode);
+  }
+  if(state==='levelup') proceedAfterLevelUp();
+  if(state==='victory') returnToMenu();
+}
+
+/* ── LANE HELPER ── */
+function getLaneX(laneCount,laneIdx){
+  const roadW=280,roadX=(W-roadW)/2;
+  return roadX+(roadW/laneCount)*laneIdx+(roadW/laneCount)/2;
+}
+
+/* ── GAME START ── */
+function startGame(idx,campaign){
+  stageIdx=idx;
+  campaignMode=campaign;
+  const st=STAGES[idx];
+  score=campaign?campaignScore:0;
+  scoreAcc=score;
+  lives=campaign?campaignLives:3;
+  scoreAdd=1;
+  player={x:W/2,y:H-110,w:30,h:52,vx:0,shielded:false,ghosted:false,nitro:false,invincible:false,invT:0};
+  enemies=[];particles=[];powerups=[];boulders=[];
+  activeEffects={};magnetActive=false;magnetT=0;
+  spawnTimer=0;powerupTimer=0;stageTime=0;
+  stripeY=0;parallax2=0;
+  boss=null;bossSpawned=false;
+  shake=0; // FIX: always reset shake on new game
+  paused=false;
+  state='play';
+}
+
+function startCampaign(){
+  campaignScore=0;campaignLives=3;
+  startGame(0,true);
+}
+
+function returnToMenu(){
+  shake=0; // FIX: kill shake when going to menu
+  state='menu';
+  enemies=[];particles=[];powerups=[];boulders=[];boss=null;
+}
+
+function nextCampaignStage(){
+  if(stageIdx<7){
+    campaignScore=score;campaignLives=lives;
+    startGame(stageIdx+1,true);
+  } else {
+    state='victory';
+  }
+}
+
+function proceedAfterLevelUp(){
+  nextCampaignStage();
+}
+
+/* ── SPAWN ── */
+function spawnEnemy(){
+  const st=STAGES[stageIdx];
+  const lanes=st.lanes;
+  const laneIdx=Math.floor(Math.random()*lanes);
+  const x=getLaneX(lanes,laneIdx);
+  const isTruck=(stageIdx>=1&&Math.random()<0.25);
+  const isBus=(stageIdx>=5&&Math.random()<0.1);
+  const w=isBus?34:isTruck?34:26;
+  const h=isBus?72:isTruck?56:44;
+  // Enemy speed = stage speed + random variance
+  enemies.push({x,y:-h-10,w,h,vy:st.speed*(1.2+Math.random()*0.6),type:isBus?'bus':isTruck?'truck':'sedan'});
+}
+
+function spawnBoulder(){
+  const roadX=(W-280)/2;
+  const x=roadX+20+Math.random()*240;
+  boulders.push({x,y:-30,r:20,vy:STAGES[stageIdx].speed*0.9});
+}
+
+function spawnPowerup(){
+  const unlocked=getUnlockedPowerups();
+  const pu=unlocked[Math.floor(Math.random()*unlocked.length)];
+  const roadX=(W-280)/2;
+  const x=roadX+20+Math.random()*240;
+  powerups.push({x,y:-20,r:14,type:pu.type,color:pu.color,label:pu.label,vy:STAGES[stageIdx].speed*0.8});
+}
+
+function getUnlockedPowerups(){
+  let avail=[POWERUPS[1]];
+  if(stageIdx>=1)avail.push(POWERUPS[0]);
+  if(stageIdx>=2)avail.push(POWERUPS[2],POWERUPS[7]);
+  if(stageIdx>=3)avail.push(POWERUPS[3]);
+  if(stageIdx>=4)avail.push(POWERUPS[4]);
+  if(stageIdx>=5)avail.push(POWERUPS[5],POWERUPS[6]);
+  return avail;
+}
+
+function spawnBoss(){
+  bossHP=bossMaxHP=300+(stageIdx*60);
+  bossTimer=720;
+  bossSpawned=true;
+  boss={x:W/2,y:-90,w:60,h:90,vy:1.2,vx:1.8,timer:0,name:STAGES[stageIdx].boss};
+}
+
+/* ── PARTICLES ── */
+function addParticles(x,y,color,n=8){
+  for(let i=0;i<n;i++){
+    let a=Math.random()*Math.PI*2;
+    let s=2+Math.random()*4;
+    particles.push({x,y,vx:Math.cos(a)*s,vy:Math.sin(a)*s,life:30+Math.random()*20,color,size:3+Math.random()*3});
+  }
+}
+
+/* ── COLLISION ── */
+function rectsOverlap(ax,ay,aw,ah,bx,by,bw,bh){
+  return ax<bx+bw&&ax+aw>bx&&ay<by+bh&&ay+ah>by;
+}
+function circRect(cx,cy,cr,rx,ry,rw,rh){
+  let nearX=Math.max(rx,Math.min(cx,rx+rw));
+  let nearY=Math.max(ry,Math.min(cy,ry+rh));
+  let dx=cx-nearX,dy=cy-nearY;
+  return dx*dx+dy*dy<cr*cr;
+}
+
+/* ── POWERUP APPLY ── */
+function applyPowerup(pu){
+  switch(pu.type){
+    case 'shield': player.shielded=true; break;
+    case 'boost':  activeEffects.boost=480; scoreAdd=2; break;
+    case 'slowmo': activeEffects.slowmo=300; break;
+    case 'nitro':  activeEffects.nitro=180; player.nitro=true; player.invincible=true; break;
+    case 'life':   lives=Math.min(5,lives+1); break;
+    case 'magnet': magnetActive=true; magnetT=420; break;
+    case 'bomb':
+      enemies.forEach(e=>addParticles(e.x,e.y,'#ff4400',6));
+      boulders.forEach(b=>addParticles(b.x,b.y,'#888',4));
+      enemies=[];boulders=[];
+      shake=10;
+      if(boss) bossHP=Math.max(0,bossHP-80);
+      break;
+    case 'ghost': player.ghosted=true; activeEffects.ghost=360; break;
+  }
+  addParticles(pu.x,pu.y,pu.color,10);
+}
+
+/* ── HIT PLAYER ── */
+function hitPlayer(){
+  if(player.invincible) return;
+  lives--;
+  player.invincible=true;
+  player.invT=120;
+  shake=14; // FIX: moderate shake value, and it always decays in loop()
+  if(lives<=0){
+    shake=0; // FIX: zero shake immediately on game over so screen doesn't shake on gameover screen
+    state='gameover';
+  }
+}
+
+/* ── UPDATE ── */
+function update(){
+  if(paused||state!=='play') return;
+
+  const st=STAGES[stageIdx];
+
+  /* ── PROGRESSIVE SPEED RAMP ── */
+  // Increase every 10 seconds (600 frames), 8% per step, max 2.5x base speed.
+  stageTime++;
+  const rampSteps=Math.floor(stageTime/600);
+  const rampMult=Math.min(2.5,1+rampSteps*0.08);
+
+  // Power-up overrides layer on top of ramp
+  const effectMult=activeEffects.slowmo>0?0.5:activeEffects.nitro>0?1.7:1;
+
+  // Final speed multiplier used for everything
+  const speedMult=rampMult*effectMult;
+  const roadSpeed=st.speed*speedMult;
+
+  /* ── PLAYER MOVEMENT (left/right only — Y is fixed) ── */
+  let moveX=0;
+  if(keys['ArrowLeft']||keys['a']||keys['A']) moveX=-1;
+  if(keys['ArrowRight']||keys['d']||keys['D']) moveX=1;
+
+  if(st.slippery||st.icy){
+    player.vx=player.vx*0.90+moveX*3.5;
+  } else {
+    player.vx=moveX*5;
+  }
+  player.x+=player.vx;
+  const roadX=(W-280)/2;
+  player.x=Math.max(roadX+player.w/2,Math.min(roadX+280-player.w/2,player.x));
+
+  /* ── ROAD SCROLL ── */
+  stripeY=(stripeY+roadSpeed)%50;
+  parallax2=(parallax2+roadSpeed*0.2)%H;
+
+  /* ── INVINCIBILITY TICK ── */
+  if(player.invT>0){player.invT--;if(player.invT===0)player.invincible=false;}
+
+  /* ── EFFECT TIMERS ── */
+  for(let k in activeEffects){
+    activeEffects[k]--;
+    if(activeEffects[k]<=0){
+      delete activeEffects[k];
+      if(k==='boost'){scoreAdd=1;}
+      if(k==='nitro'){player.nitro=false;player.invincible=false;}
+      if(k==='ghost'){player.ghosted=false;}
+    }
+  }
+
+  /* ── MAGNET ── */
+  if(magnetActive){
+    magnetT--;
+    if(magnetT<=0) magnetActive=false;
+    powerups.forEach(pu=>{
+      let dx=player.x-pu.x,dy=player.y-pu.y;
+      let dist=Math.sqrt(dx*dx+dy*dy)||1;
+      if(dist<180){pu.x+=dx/dist*6;pu.y+=dy/dist*6;}
+    });
+  }
+
+  /* ── SPAWN ENEMIES ── */
+  spawnTimer++;
+  // Spawn rate tightens as speed ramps — more traffic over time
+  const effectiveSpawnRate=Math.max(30,Math.floor(st.spawnRate/rampMult));
+  if(spawnTimer>=effectiveSpawnRate){
+    spawnTimer=0;
+    spawnEnemy();
+    if(st.boulders&&Math.random()<0.35) spawnBoulder();
+  }
+
+  /* ── SPAWN POWERUPS ── */
+  powerupTimer++;
+  if(powerupTimer>=200){powerupTimer=0;if(Math.random()<0.65) spawnPowerup();}
+
+  /* ── BOSS SPAWN ── */
+  if(!bossSpawned&&st.boss&&score>=(st.target*0.55)){
+    spawnBoss();
+  }
+
+  /* ── MOVE ENEMIES (they move DOWN toward player) ── */
+  enemies=enemies.filter(e=>{
+    e.y+=e.vy*speedMult;
+    if(!player.ghosted&&!player.invincible&&
+       rectsOverlap(player.x-player.w/2,player.y-player.h/2,player.w,player.h,
+                    e.x-e.w/2,e.y-e.h/2,e.w,e.h)){
+      if(player.shielded){
+        player.shielded=false;
+        addParticles(player.x,player.y,'#00aaff',10);
+        shake=6;
+      } else {
+        hitPlayer();
+        addParticles(e.x,e.y,'#ff4400',12);
+      }
+      return false;
+    }
+    return e.y<H+120;
+  });
+
+  /* ── MOVE BOULDERS ── */
+  boulders=boulders.filter(b=>{
+    b.y+=b.vy*speedMult;
+    if(!player.ghosted&&!player.invincible&&
+       circRect(b.x,b.y,b.r,player.x-player.w/2,player.y-player.h/2,player.w,player.h)){
+      if(player.shielded){
+        player.shielded=false;
+        addParticles(player.x,player.y,'#aaaaaa',8);
+        shake=6;
+      } else {
+        hitPlayer();
+        addParticles(b.x,b.y,'#888',8);
+      }
+      return false;
+    }
+    return b.y<H+50;
+  });
+
+  /* ── MOVE POWERUPS ── */
+  powerups=powerups.filter(pu=>{
+    pu.y+=pu.vy*speedMult;
+    if(circRect(pu.x,pu.y,pu.r,player.x-player.w/2,player.y-player.h/2,player.w,player.h)){
+      applyPowerup(pu);
+      return false;
+    }
+    return pu.y<H+40;
+  });
+
+  /* ── BOSS UPDATE ── */
+  if(boss){
+    boss.timer++;
+    boss.x+=boss.vx*(activeEffects.slowmo>0?0.4:1);
+    boss.y=Math.min(70,boss.y+boss.vy);
+    if(boss.x<80||boss.x>W-80) boss.vx*=-1;
+    // Boss fires projectiles
+    if(boss.timer%80===0){
+      enemies.push({x:boss.x,y:boss.y+boss.h/2+5,w:16,h:24,vy:st.speed*1.4,type:'bullet'});
+    }
+    // Boss body collision
+    if(!player.ghosted&&!player.invincible&&
+       rectsOverlap(player.x-player.w/2,player.y-player.h/2,player.w,player.h,
+                    boss.x-boss.w/2,boss.y-boss.h/2,boss.w,boss.h)){
+      if(player.shielded){player.shielded=false;shake=8;}
+      else{hitPlayer();}
+    }
+    bossTimer--;
+    if(bossHP<=0||bossTimer<=0){
+      addParticles(boss.x,boss.y,'#ff00aa',24);
+      shake=8;
+      if(bossHP<=0) scoreAcc+=400;
+      boss=null;
+    }
+  }
+
+  /* ── SCORE ── */
+  // Score ticks faster at higher ramp levels as a reward for surviving longer
+  scoreAcc+=scoreAdd*st.speed*0.05*speedMult;
+  score=Math.floor(scoreAcc);
+
+  /* ── PARTICLES ── */
+  particles=particles.filter(p=>{
+    p.x+=p.vx;p.y+=p.vy;
+    p.vx*=0.92;p.vy*=0.92;
+    p.life--;p.size*=0.95;
+    return p.life>0;
+  });
+
+  /* ── STAGE COMPLETION CHECK ── */
+  if(score>=st.target&&!boss){
+    let hi=save.hiscores[stageIdx+1]||0;
+    if(score>hi){save.hiscores[stageIdx+1]=score;saveProg();}
+    if(campaignMode){
+      if(stageIdx>=7){state='victory';}
+      else{
+        if(!save.unlocked.includes(stageIdx+2)){save.unlocked.push(stageIdx+2);saveProg();}
+        state='levelup';
+      }
+    } else {
+      if(!save.unlocked.includes(stageIdx+2)&&stageIdx<7){save.unlocked.push(stageIdx+2);saveProg();}
+      state='results';
+    }
+  }
+}
+
+/* ── DRAW: ROAD ── */
+function drawRoad(){
+  const st=STAGES[stageIdx];
+  const roadW=280,roadX=(W-roadW)/2;
+
+  // Background
+  ctx.fillStyle=st.bg||P.bg;
+  ctx.fillRect(0,0,W,H);
+
+  // Scrolling roadside scenery (buildings/trees silhouette)
+  ctx.fillStyle='#ffffff06';
+  for(let i=0;i<6;i++){
+    let bh=40+i*25,bw=25+i*8;
+    let by=((parallax2+i*110)%H)-bh;
+    ctx.fillRect(4+i*3,by,bw,bh);
+    ctx.fillRect(W-30-i*3,by+H/3,bw,bh);
+  }
+
+  // Road surface
+  ctx.fillStyle=P.road;
+  ctx.fillRect(roadX,0,roadW,H);
+
+  // Edge shadows on road
+  let grd=ctx.createLinearGradient(roadX,0,roadX+roadW,0);
+  grd.addColorStop(0,'#00000055');grd.addColorStop(0.08,'transparent');
+  grd.addColorStop(0.92,'transparent');grd.addColorStop(1,'#00000055');
+  ctx.fillStyle=grd;ctx.fillRect(roadX,0,roadW,H);
+
+  // Lane dividers — dashed lines that scroll downward (car moving forward illusion)
+  // FIX: use stripeY to animate stripes moving down the screen
+  const lanes=st.lanes;
+  const laneW=roadW/lanes;
+  const stripeLen=28,gapLen=22,period=stripeLen+gapLen;
+  ctx.strokeStyle='#ffffff35';
+  ctx.lineWidth=2;
+  ctx.setLineDash([stripeLen,gapLen]);
+  for(let i=1;i<lanes;i++){
+    let lx=roadX+laneW*i;
+    // offset by stripeY so stripes appear to move downward each frame
+    ctx.lineDashOffset=-stripeY;
+    ctx.beginPath();
+    ctx.moveTo(lx,0);
+    ctx.lineTo(lx,H);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.lineDashOffset=0;
+
+  // Yellow edge lines
+  ctx.strokeStyle='#ffe600aa';ctx.lineWidth=3;
+  ctx.beginPath();ctx.moveTo(roadX,0);ctx.lineTo(roadX,H);ctx.stroke();
+  ctx.beginPath();ctx.moveTo(roadX+roadW,0);ctx.lineTo(roadX+roadW,H);ctx.stroke();
+
+  // Shoulders
+  ctx.fillStyle='#ffffff06';
+  ctx.fillRect(0,0,roadX,H);
+  ctx.fillRect(roadX+roadW,0,W-(roadX+roadW),H);
+}
+
+/* ── DRAW: WEATHER ── */
+function drawWeatherOverlay(){
+  const st=STAGES[stageIdx];
+  if(!st.overlay) return;
+  switch(st.overlay){
+    case 'sandstorm':
+      ctx.fillStyle='#c8a45038';
+      ctx.fillRect(0,0,W,H);
+      for(let i=0;i<25;i++){
+        ctx.fillStyle='#c8a45018';
+        ctx.fillRect(Math.random()*W,Math.random()*H,80+Math.random()*100,2);
+      }
+      break;
+    case 'rain':
+      for(let i=0;i<50;i++){
+        ctx.strokeStyle='#6699ff2a';ctx.lineWidth=1;
+        ctx.beginPath();
+        let rx=Math.random()*W,ry=Math.random()*H;
+        ctx.moveTo(rx,ry);ctx.lineTo(rx-3,ry+14);ctx.stroke();
+      }
+      break;
+    case 'snow':
+      for(let i=0;i<35;i++){
+        ctx.fillStyle='#ffffff20';
+        ctx.beginPath();
+        ctx.arc(Math.random()*W,Math.random()*H,1+Math.random()*2,0,Math.PI*2);
+        ctx.fill();
+      }
+      break;
+    case 'night':{
+      // Headlight cone from player position
+      let grad=ctx.createRadialGradient(player.x,player.y-20,8,player.x,player.y-20,200);
+      grad.addColorStop(0,'#ffffff14');grad.addColorStop(1,'transparent');
+      ctx.fillStyle=grad;ctx.fillRect(0,0,W,H);
+      // Dark edges
+      ctx.fillStyle='#00000070';
+      ctx.fillRect(0,0,70,H);ctx.fillRect(W-70,0,70,H);
+      break;
+    }
+    case 'neon':
+      // Neon scanlines
+      for(let i=0;i<H;i+=4){ctx.fillStyle='#7f77dd08';ctx.fillRect(0,i,W,2);}
+      break;
+  }
+}
+
+/* ── DRAW: CAR ── */
+function drawCarShape(x,y,w,h,body,dark,glass,alpha){
+  ctx.save();
+  if(alpha!==undefined) ctx.globalAlpha=alpha;
+  // Body
+  ctx.fillStyle=body;
+  ctx.beginPath();
+  if(ctx.roundRect) ctx.roundRect(x-w/2,y-h/2,w,h,4);
+  else ctx.rect(x-w/2,y-h/2,w,h);
+  ctx.fill();
+  // Cabin roof
+  ctx.fillStyle=dark;
+  ctx.fillRect(x-w/2+5,y-h/2+h*0.18,w-10,h*0.36);
+  // Windshield
+  ctx.fillStyle=glass;
+  ctx.fillRect(x-w/2+6,y-h/2+h*0.20,w-12,h*0.14);
+  ctx.fillRect(x-w/2+6,y-h/2+h*0.38,w-12,h*0.12);
+  // Wheels
+  ctx.fillStyle='#111';
+  ctx.fillRect(x-w/2-4,y-h/2+5,6,13);
+  ctx.fillRect(x+w/2-2,y-h/2+5,6,13);
+  ctx.fillRect(x-w/2-4,y+h/2-18,6,13);
+  ctx.fillRect(x+w/2-2,y+h/2-18,6,13);
+  // Headlights
+  ctx.fillStyle='#ffff88';
+  ctx.fillRect(x-w/2+3,y-h/2,8,5);
+  ctx.fillRect(x+w/2-11,y-h/2,8,5);
+  // Taillights
+  ctx.fillStyle='#ff2200';
+  ctx.fillRect(x-w/2+3,y+h/2-5,8,5);
+  ctx.fillRect(x+w/2-11,y+h/2-5,8,5);
+  ctx.restore();
+}
+
+function drawTruckShape(x,y,w,h,body,dark){
+  ctx.fillStyle=body;
+  if(ctx.roundRect){ctx.beginPath();ctx.roundRect(x-w/2,y-h/2,w,h,3);ctx.fill();}
+  else{ctx.fillRect(x-w/2,y-h/2,w,h);}
+  ctx.fillStyle=dark;
+  ctx.fillRect(x-w/2+3,y-h/2,w-6,h*0.26);
+  ctx.fillStyle='#aaffff28';
+  ctx.fillRect(x-w/2+4,y-h/2+2,w-8,h*0.11);
+  ctx.fillStyle='#111';
+  ctx.fillRect(x-w/2-5,y-h/2+4,7,18);
+  ctx.fillRect(x+w/2-2,y-h/2+4,7,18);
+  ctx.fillRect(x-w/2-5,y+h/2-22,7,18);
+  ctx.fillRect(x+w/2-2,y+h/2-22,7,18);
+  ctx.fillStyle='#ffff88';
+  ctx.fillRect(x-w/2+2,y-h/2,10,6);
+  ctx.fillRect(x+w/2-12,y-h/2,10,6);
+}
+
+function drawEnemy(e){
+  if(e.type==='sedan')
+    drawCarShape(e.x,e.y,e.w,e.h,P.enemy,P.enemyDark,'#ff999940');
+  else if(e.type==='truck'||e.type==='bus')
+    drawTruckShape(e.x,e.y,e.w,e.h,P.truck,P.truckDark);
+  else if(e.type==='bullet'){
+    ctx.fillStyle='#ff3300';
+    ctx.beginPath();ctx.arc(e.x,e.y+e.h/2,9,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='#ff880060';
+    ctx.beginPath();ctx.arc(e.x,e.y+e.h/2,13,0,Math.PI*2);ctx.fill();
+  }
+}
+
+/* ── DRAW: PLAYER ── */
+function drawPlayer(){
+  // Blink when invincible
+  if(player.invincible&&Math.floor(Date.now()/80)%2===0) return;
+  // Shield aura
+  if(player.shielded){
+    ctx.fillStyle=P.shieldGlow;
+    ctx.beginPath();
+    ctx.ellipse(player.x,player.y,player.w*0.75,player.h*0.6,0,0,Math.PI*2);
+    ctx.fill();
+    ctx.strokeStyle=P.shield;ctx.lineWidth=2;ctx.stroke();
+  }
+  // Nitro trail
+  if(player.nitro){
+    ctx.fillStyle='#ff660038';
+    ctx.beginPath();
+    ctx.ellipse(player.x,player.y+player.h/2+12,player.w*0.45,16,0,0,Math.PI*2);
+    ctx.fill();
+  }
+  // Ghost opacity
+  drawCarShape(player.x,player.y,player.w,player.h,P.player,P.playerDark,P.playerGlass,player.ghosted?0.4:1.0);
+}
+
+/* ── DRAW: BOSS ── */
+function drawBoss(){
+  if(!boss) return;
+  const {x,y,w,h}=boss;
+  // Glow
+  ctx.fillStyle='#ff00aa1a';
+  ctx.beginPath();ctx.ellipse(x,y,w*0.9,h*0.7,0,0,Math.PI*2);ctx.fill();
+  // Body
+  ctx.fillStyle=P.boss;
+  if(ctx.roundRect){ctx.beginPath();ctx.roundRect(x-w/2,y-h/2,w,h,8);ctx.fill();}
+  else ctx.fillRect(x-w/2,y-h/2,w,h);
+  ctx.fillStyle=P.bossDark;
+  ctx.fillRect(x-w/2+5,y-h/2,w-10,h*0.28);
+  // Pulsing headlights
+  ctx.fillStyle=`hsl(${(Date.now()/15)%360},100%,65%)`;
+  ctx.fillRect(x-w/2+4,y-h/2,12,8);
+  ctx.fillRect(x+w/2-16,y-h/2,12,8);
+  // Boss HP bar
+  const bw=180,bx2=(W-bw)/2,by2=H-32;
+  ctx.fillStyle='#333';ctx.fillRect(bx2,by2,bw,12);
+  ctx.fillStyle='#ff00aa';ctx.fillRect(bx2,by2,bw*(bossHP/bossMaxHP),12);
+  ctx.strokeStyle='#ff00aa66';ctx.lineWidth=1;ctx.strokeRect(bx2,by2,bw,12);
+  ctx.fillStyle='#ff00aa';ctx.font='bold 11px Courier New';ctx.textAlign='center';
+  ctx.fillText('BOSS: '+boss.name,W/2,by2-5);
+  ctx.fillStyle='#ffffff77';ctx.font='10px Courier New';
+  ctx.fillText('SURVIVE: '+Math.ceil(bossTimer/60)+'s',W/2,by2-17);
+}
+
+/* ── DRAW: POWERUP ── */
+function drawPowerup(pu){
+  ctx.save();
+  ctx.shadowColor=pu.color;ctx.shadowBlur=10;
+  ctx.strokeStyle=pu.color;ctx.lineWidth=2;
+  ctx.beginPath();ctx.arc(pu.x,pu.y,pu.r,0,Math.PI*2);ctx.stroke();
+  ctx.fillStyle=pu.color+'40';ctx.fill();
+  ctx.shadowBlur=0;
+  ctx.fillStyle=pu.color;ctx.font='bold 9px Courier New';ctx.textAlign='center';
+  ctx.fillText(pu.label,pu.x,pu.y+4);
+  ctx.restore();
+}
+
+/* ── DRAW: BOULDER ── */
+function drawBoulder(b){
+  ctx.fillStyle='#777';
+  ctx.beginPath();ctx.arc(b.x,b.y,b.r,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='#aaa';
+  ctx.beginPath();ctx.arc(b.x-5,b.y-5,7,0,Math.PI*2);ctx.fill();
+  ctx.strokeStyle='#444';ctx.lineWidth=1;
+  ctx.beginPath();ctx.arc(b.x,b.y,b.r,0,Math.PI*2);ctx.stroke();
+}
+
+/* ── DRAW: PARTICLES ── */
+function drawParticles(){
+  particles.forEach(p=>{
+    let alpha=Math.floor(p.life*8).toString(16).padStart(2,'0');
+    ctx.fillStyle=p.color+alpha;
+    ctx.beginPath();ctx.arc(p.x,p.y,Math.max(0.5,p.size),0,Math.PI*2);ctx.fill();
+  });
+}
+
+/* ── DRAW: HUD ── */
+function drawHUD(){
+  const st=STAGES[stageIdx];
+
+  // Compute ramp for display
+  const rampSteps=Math.floor(stageTime/600);
+  const rampMult=Math.min(2.5,1+rampSteps*0.08);
+  const speedPct=Math.round((rampMult-1)/(2.5-1)*100); // 0–100%
+
+  // Top bar
+  ctx.fillStyle='#00000099';ctx.fillRect(0,0,W,42);
+  // Lives
+  ctx.font='14px Courier New';ctx.textAlign='left';
+  let heartsStr='';
+  for(let i=0;i<lives;i++) heartsStr+='♥ ';
+  ctx.fillStyle='#ff4488';ctx.fillText(heartsStr,8,26);
+  // Score — center
+  ctx.textAlign='center';ctx.fillStyle=P.hud;ctx.font='bold 15px Courier New';
+  ctx.fillText('SCORE: '+score,W/2,26);
+  // Stage name — right
+  ctx.textAlign='right';ctx.fillStyle='#ffffff66';ctx.font='10px Courier New';
+  ctx.fillText('Stage '+(stageIdx+1)+': '+st.name,W-6,26);
+
+  // Progress bar (white)
+  let prog=Math.min(1,score/st.target);
+  ctx.fillStyle='#ffffff10';ctx.fillRect(0,40,W,4);
+  ctx.fillStyle=P.hud;ctx.fillRect(0,40,W*prog,4);
+
+  // Speed ramp bar — bottom right, color shifts red as speed increases
+  const barW=80;
+  const rampColor=rampMult<1.5?'#00e5ff':rampMult<2.0?'#ffe600':'#ff4400';
+  ctx.fillStyle='#00000066';ctx.fillRect(W-barW-6,H-22,barW,10);
+  ctx.fillStyle=rampColor;ctx.fillRect(W-barW-6,H-22,barW*Math.min(1,(rampMult-1)/1.5),10);
+  ctx.strokeStyle=rampColor+'66';ctx.lineWidth=1;ctx.strokeRect(W-barW-6,H-22,barW,10);
+  ctx.fillStyle=rampColor;ctx.font='bold 9px Courier New';ctx.textAlign='right';
+  ctx.fillText('SPEED x'+rampMult.toFixed(2),W-6,H-26);
+
+  // Active effects strip bottom-left
+  let efxKeys=Object.keys(activeEffects);
+  if(magnetActive) efxKeys.push('magnet');
+  if(player.shielded) efxKeys.push('shield');
+  efxKeys.forEach((k,i)=>{
+    let pu=POWERUPS.find(p=>p.type===k);
+    if(!pu) return;
+    ctx.fillStyle=pu.color+'bb';ctx.fillRect(8+i*36,H-40,30,30);
+    ctx.fillStyle='#000';ctx.font='bold 8px Courier New';ctx.textAlign='center';
+    ctx.fillText(pu.label,8+i*36+15,H-22);
+    if(activeEffects[k]&&pu.duration>0){
+      let pct=activeEffects[k]/pu.duration;
+      ctx.fillStyle='#ffffff50';ctx.fillRect(8+i*36,H-12,30*pct,5);
+    }
+  });
+
+  if(muted){ctx.fillStyle='#ffffff55';ctx.font='12px Courier New';ctx.textAlign='left';ctx.fillText('[M] MUTED',8,H-8);}
+  if(paused){
+    ctx.fillStyle='#000000aa';ctx.fillRect(0,0,W,H);
+    ctx.fillStyle=P.hud;ctx.font='bold 34px Courier New';ctx.textAlign='center';
+    ctx.fillText('PAUSED',W/2,H/2-10);
+    ctx.fillStyle='#ffffff66';ctx.font='13px Courier New';
+    ctx.fillText('P or ESC to resume',W/2,H/2+28);
+  }
+}
+
+/* ── MENU BUTTON HELPER ── */
+function menuBtn(x,y,w,h,label,color){
+  ctx.fillStyle=color+'20';ctx.fillRect(x,y,w,h);
+  ctx.strokeStyle=color+'80';ctx.lineWidth=1;ctx.strokeRect(x,y,w,h);
+  ctx.fillStyle=color;ctx.font='bold 14px Courier New';ctx.textAlign='center';
+  ctx.fillText(label,x+w/2,y+h/2+5);
+}
+
+/* ── DRAW: MENU ── */
+function drawMenu(){
+  ctx.fillStyle='#07070f';ctx.fillRect(0,0,W,H);
+  // Grid
+  ctx.strokeStyle='#7f77dd14';ctx.lineWidth=1;
+  for(let i=0;i<W;i+=40){ctx.beginPath();ctx.moveTo(i,0);ctx.lineTo(i,H);ctx.stroke();}
+  for(let i=0;i<H;i+=40){ctx.beginPath();ctx.moveTo(0,i);ctx.lineTo(W,i);ctx.stroke();}
+  // Title
+  ctx.fillStyle=P.neon3;ctx.font='bold 56px Courier New';ctx.textAlign='center';
+  ctx.fillText('ROAD',W/2,90);
+  ctx.fillStyle=P.neon1;
+  ctx.fillText('RUSH',W/2,148);
+  ctx.fillStyle='#ffffff40';ctx.font='11px Courier New';
+  ctx.fillText('8 STAGES  ·  BOSSES  ·  POWER-UPS  ·  CAMPAIGN',W/2,170);
+  // Stage preview
+  let st=STAGES[stageIdx];
+  ctx.fillStyle='#ffffff0e';ctx.fillRect(55,185,290,55);
+  ctx.strokeStyle=P.neon1+'55';ctx.lineWidth=1;ctx.strokeRect(55,185,290,55);
+  ctx.fillStyle=P.neon1;ctx.font='bold 13px Courier New';ctx.textAlign='center';
+  ctx.fillText('Stage '+(stageIdx+1)+': '+st.name,W/2,208);
+  ctx.fillStyle='#ffffff55';ctx.font='11px Courier New';
+  ctx.fillText((st.boss?'Boss: '+st.boss:'No Boss')+'  |  Target: '+st.target+' pts',W/2,228);
+  // Stage navigation arrows
+  ctx.fillStyle=stageIdx>0?P.neon3:'#ffffff18';ctx.font='20px Courier New';ctx.textAlign='center';
+  ctx.fillText('◀',38,218);
+  ctx.fillStyle=stageIdx<7?P.neon3:'#ffffff18';
+  ctx.fillText('▶',W-38,218);
+  // Buttons
+  menuBtn(100,248,200,38,'▶  PLAY ARCADE',P.neon3);
+  menuBtn(100,300,200,38,'◎  CAMPAIGN',P.neon1);
+  menuBtn(100,352,200,38,'☰  STAGE SELECT','#ff00aa');
+  // Controls hint
+  ctx.fillStyle='#ffffff28';ctx.font='10px Courier New';ctx.textAlign='center';
+  ctx.fillText('← → navigate stages   ENTER play   C campaign   M mute',W/2,418);
+  ctx.fillText('ESC/P to pause during game',W/2,434);
+  // Hi score
+  let hi=save.hiscores[stageIdx+1];
+  if(hi){ctx.fillStyle='#ffe60077';ctx.font='11px Courier New';ctx.fillText('BEST: '+hi+' pts',W/2,465);}
+}
+
+/* ── DRAW: STAGE SELECT ── */
+function drawStageSelect(){
+  ctx.fillStyle='#07070f';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle=P.neon1;ctx.font='bold 22px Courier New';ctx.textAlign='center';
+  ctx.fillText('SELECT STAGE',W/2,38);
+  ctx.fillStyle='#ffffff40';ctx.font='10px Courier New';
+  ctx.fillText('ENTER play  ·  C campaign  ·  R reset progress  ·  ESC back',W/2,58);
+  for(let i=0;i<8;i++){
+    let col=i%4,row=Math.floor(i/4);
+    let bx=18+col*96,by=76+row*102;
+    let unlocked=save.unlocked.includes(i+1);
+    let selected=stageIdx===i;
+    let hi=save.hiscores[i+1];
+    let st=STAGES[i];
+    ctx.fillStyle=selected?P.neon1+'28':unlocked?'#ffffff0e':'#ffffff04';
+    ctx.fillRect(bx,by,86,92);
+    ctx.strokeStyle=selected?P.neon1:unlocked?'#ffffff28':'#ffffff0e';
+    ctx.lineWidth=selected?2:1;ctx.strokeRect(bx,by,86,92);
+    ctx.fillStyle=unlocked?P.neon3:'#ffffff20';ctx.font='bold 22px Courier New';ctx.textAlign='center';
+    ctx.fillText(i+1,bx+43,by+32);
+    ctx.fillStyle=unlocked?'#ffffff80':'#ffffff20';ctx.font='9px Courier New';
+    let words=st.name.split(' ');
+    ctx.fillText(words[0],bx+43,by+50);
+    if(words[1]) ctx.fillText(words[1],bx+43,by+62);
+    if(st.boss){ctx.fillStyle='#ff00aa77';ctx.font='8px Courier New';ctx.fillText('⚡BOSS',bx+43,by+76);}
+    if(hi){ctx.fillStyle='#ffe60060';ctx.font='8px Courier New';ctx.fillText(hi,bx+43,by+88);}
+    if(!unlocked){ctx.fillStyle='#00000077';ctx.fillRect(bx,by,86,92);ctx.fillStyle='#ffffff30';ctx.font='18px Courier New';ctx.fillText('🔒',bx+43,by+50);}
+  }
+  menuBtn(120,490,160,36,'◎ CAMPAIGN',P.neon1);
+  menuBtn(10,490,100,36,'R RESET','#ff4444');
+  ctx.fillStyle='#ffffff40';ctx.font='11px Courier New';ctx.textAlign='center';
+  ctx.fillText('ESC to go back',W/2,558);
+}
+
+/* ── DRAW: LEVEL UP ── */
+function drawLevelUp(){
+  ctx.fillStyle='#000000cc';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle=P.neon1;ctx.font='bold 42px Courier New';ctx.textAlign='center';
+  ctx.fillText('LEVEL UP!',W/2,200);
+  ctx.fillStyle=P.neon3;ctx.font='18px Courier New';ctx.textAlign='center';
+  if(stageIdx+1<8){
+    let nextSt=STAGES[stageIdx+1];
+    ctx.fillText('Stage '+(stageIdx+2)+': '+nextSt.name,W/2,255);
+    if(nextSt.boss) ctx.fillText('⚡ BOSS STAGE AHEAD',W/2,285);
+  }
+  ctx.fillStyle='#ffffff55';ctx.font='13px Courier New';
+  ctx.fillText('Score: '+score+'  |  Lives: '+lives,W/2,320);
+  ctx.fillStyle='#ffffff40';ctx.font='12px Courier New';
+  ctx.fillText('ENTER or tap to continue',W/2,400);
+}
+
+/* ── DRAW: RESULTS ── */
+function drawResults(){
+  ctx.fillStyle='#07070f';ctx.fillRect(0,0,W,H);
+  const st=STAGES[stageIdx];
+  let stars=score>=st.target?3:score>=st.target*0.7?2:1;
+  ctx.fillStyle=P.neon1;ctx.font='bold 26px Courier New';ctx.textAlign='center';
+  ctx.fillText('STAGE COMPLETE!',W/2,58);
+  ctx.fillStyle=P.neon3;ctx.font='20px Courier New';
+  ctx.fillText(st.name,W/2,92);
+  for(let i=0;i<3;i++){
+    ctx.fillStyle=i<stars?P.star:'#ffffff20';
+    ctx.font='40px Courier New';
+    ctx.fillText('★',W/2+(i-1)*54,158);
+  }
+  ctx.fillStyle=P.hud;ctx.font='bold 22px Courier New';
+  ctx.fillText('SCORE: '+score,W/2,212);
+  let hi=save.hiscores[stageIdx+1]||0;
+  ctx.fillStyle='#ffe60077';ctx.font='12px Courier New';
+  ctx.fillText('BEST: '+hi,W/2,236);
+  ctx.fillStyle='#ffffff44';ctx.font='11px Courier New';
+  if(campaignMode&&stageIdx<7) ctx.fillText('ENTER → Next Stage',W/2,305);
+  ctx.fillText('R → Retry    ESC → Menu',W/2,328);
+  if(campaignMode&&stageIdx<7){
+    menuBtn(205,430,185,36,'NEXT STAGE ▶',P.neon3);
+  }
+  menuBtn(10,480,185,36,'◀ MENU',P.neon1);
+  menuBtn(205,480,185,36,'↺ RETRY',P.neon3);
+}
+
+/* ── DRAW: GAME OVER ── */
+function drawGameOver(){
+  ctx.fillStyle='#07070f';ctx.fillRect(0,0,W,H);
+  ctx.fillStyle='#ff4444';ctx.font='bold 46px Courier New';ctx.textAlign='center';
+  ctx.fillText('GAME OVER',W/2,175);
+  ctx.fillStyle=P.hud;ctx.font='22px Courier New';ctx.textAlign='center';
+  ctx.fillText('Score: '+score,W/2,245);
+  ctx.fillStyle='#ffffff44';ctx.font='12px Courier New';
+  ctx.fillText('Stage: '+STAGES[stageIdx].name,W/2,276);
+  menuBtn(100,360,200,38,'◀ MENU',P.neon1);
+  menuBtn(100,412,200,38,'↺ RETRY',P.neon3);
+  ctx.fillStyle='#ffffff33';ctx.font='11px Courier New';
+  ctx.fillText('ENTER → Menu   R → Retry',W/2,474);
+}
+
+/* ── DRAW: VICTORY ── */
+function drawVictory(){
+  ctx.fillStyle='#050510';ctx.fillRect(0,0,W,H);
+  // Animated sparks
+  let t=Date.now();
+  for(let i=0;i<18;i++){
+    ctx.fillStyle=`hsl(${(t/8+i*22)%360},100%,68%)`;
+    ctx.beginPath();
+    let vx=40+Math.sin(t/600+i)*220,vy=80+Math.cos(t/500+i*0.8)*200;
+    ctx.arc(vx,vy,3,0,Math.PI*2);ctx.fill();
+  }
+  ctx.fillStyle=P.star;ctx.font='bold 46px Courier New';ctx.textAlign='center';
+  ctx.fillText('VICTORY!',W/2,158);
+  for(let i=0;i<3;i++){ctx.fillStyle=P.star;ctx.font='44px Courier New';ctx.fillText('★',W/2+(i-1)*58,238);}
+  ctx.fillStyle=P.neon3;ctx.font='15px Courier New';ctx.textAlign='center';
+  ctx.fillText('All 8 stages conquered!',W/2,284);
+  ctx.fillStyle=P.hud;ctx.font='22px Courier New';
+  ctx.fillText('Final Score: '+score,W/2,325);
+  menuBtn(125,400,150,38,'PLAY AGAIN',P.neon1);
+  ctx.fillStyle='#ffffff30';ctx.font='11px Courier New';
+  ctx.fillText('ENTER or tap to restart',W/2,470);
+}
+
+/* ── MAIN LOOP ── */
+function loop(){
+  requestAnimationFrame(loop);
+
+  // FIX: shake decays HERE, unconditionally, every frame — not inside update()
+  // This means shake stops even on gameover/menu/results screens
+  if(shake>0.3) shake*=0.82; else shake=0;
+
+  // Camera shake offset — only applied during gameplay and only if shake>0
+  let sx=0,sy=0;
+  if(shake>0 && state==='play'){
+    sx=(Math.random()-0.5)*shake;
+    sy=(Math.random()-0.5)*shake*0.4;
+  }
+
+  ctx.save();
+  if(sx||sy) ctx.translate(sx,sy);
+
+  if(state==='menu'){
+    drawMenu();
+  } else if(state==='select'){
+    drawStageSelect();
+  } else if(state==='play'){
+    update();
+    drawRoad();
+    drawWeatherOverlay();
+    boulders.forEach(drawBoulder);
+    enemies.forEach(drawEnemy);
+    powerups.forEach(drawPowerup);
+    drawParticles();
+    drawPlayer();
+    drawBoss();
+    drawHUD();
+  } else if(state==='levelup'){
+    // Keep road visible in background
+    drawRoad();
+    drawLevelUp();
+  } else if(state==='results'){
+    drawResults();
+  } else if(state==='gameover'){
+    // FIX: no update() call here, no shake applied on this screen
+    drawGameOver();
+  } else if(state==='victory'){
+    // FIX: no update() call — just draw the victory screen with its own animation
+    drawVictory();
+  }
+
+  ctx.restore();
+}
+
+loop();
+</script>
+</body>
+</html>
